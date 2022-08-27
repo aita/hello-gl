@@ -1,5 +1,6 @@
 use std::ffi::CStr;
 
+use anyhow::{anyhow, Result};
 use glutin::event::{Event, WindowEvent};
 use glutin::event_loop::{ControlFlow, EventLoop};
 use glutin::window::WindowBuilder;
@@ -7,6 +8,155 @@ use glutin::ContextBuilder;
 
 mod gl {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+}
+
+struct VertexArray(gl::types::GLuint);
+
+impl VertexArray {
+    fn new() -> Result<VertexArray> {
+        let mut id = 0;
+        unsafe {
+            gl::GenVertexArrays(1, &mut id);
+        }
+        if id == 0 {
+            return Err(anyhow!("Failed to create vertex array"));
+        } else {
+            Ok(VertexArray(id))
+        }
+    }
+
+    fn bind(&self) {
+        unsafe {
+            gl::BindVertexArray(self.0);
+        }
+    }
+
+    fn unbind(&self) {
+        unsafe {
+            gl::BindVertexArray(0);
+        }
+    }
+}
+
+struct Buffer(gl::types::GLuint);
+
+impl Buffer {
+    fn new() -> Result<Buffer> {
+        let mut id = 0;
+        unsafe {
+            gl::GenBuffers(1, &mut id);
+        }
+        if id == 0 {
+            Err(anyhow!("Failed to create buffer"))
+        } else {
+            Ok(Buffer(id))
+        }
+    }
+
+    fn bind(&self, target: gl::types::GLenum) {
+        unsafe {
+            gl::BindBuffer(target, self.0);
+        }
+    }
+
+    fn unbind(&self, target: gl::types::GLenum) {
+        unsafe {
+            gl::BindBuffer(target, 0);
+        }
+    }
+
+    fn data(&self, target: gl::types::GLenum, data: &[u8], usage: gl::types::GLenum) {
+        unsafe {
+            gl::BufferData(
+                target,
+                data.len() as gl::types::GLsizeiptr,
+                data.as_ptr() as *const gl::types::GLvoid,
+                usage,
+            );
+        }
+    }
+}
+
+struct Shader(gl::types::GLuint);
+
+impl Shader {
+    fn from_source(kind: gl::types::GLenum, source: &str) -> Result<Shader> {
+        let id = unsafe { gl::CreateShader(kind) };
+        if id == 0 {
+            return Err(anyhow!("Failed to create shader"));
+        } else {
+            unsafe {
+                gl::ShaderSource(
+                    id,
+                    1,
+                    &(source.as_bytes().as_ptr().cast()),
+                    &(source.len().try_into().unwrap()),
+                );
+                gl::CompileShader(id);
+
+                let mut success = 0;
+                gl::GetShaderiv(id, gl::COMPILE_STATUS, &mut success);
+                if success == 0 {
+                    let mut buf: Vec<u8> = Vec::with_capacity(1024);
+                    let mut log_len = 0_i32;
+                    gl::GetShaderInfoLog(id, 1024, &mut log_len, buf.as_mut_ptr().cast());
+                    buf.set_len(log_len.try_into().unwrap());
+                    Err(anyhow!("{:?}", String::from_utf8(buf)))
+                } else {
+                    Ok(Shader(id))
+                }
+            }
+        }
+    }
+
+    fn delete(&self) {
+        unsafe {
+            gl::DeleteShader(self.0);
+        }
+    }
+}
+
+struct Program(gl::types::GLuint);
+
+impl Program {
+    fn new() -> Result<Program> {
+        let id = unsafe { gl::CreateProgram() };
+        if id == 0 {
+            return Err(anyhow!("Failed to create program"));
+        } else {
+            Ok(Program(id))
+        }
+    }
+
+    fn attach(&self, shader: &Shader) {
+        unsafe {
+            gl::AttachShader(self.0, shader.0);
+        }
+    }
+
+    fn link(&self) -> Result<()> {
+        unsafe {
+            gl::LinkProgram(self.0);
+
+            let mut success = 0;
+            gl::GetProgramiv(self.0, gl::LINK_STATUS, &mut success);
+            if success == 0 {
+                let mut buf: Vec<u8> = Vec::with_capacity(1024);
+                let mut log_len = 0_i32;
+                gl::GetProgramInfoLog(self.0, 1024, &mut log_len, buf.as_mut_ptr().cast());
+                buf.set_len(log_len.try_into().unwrap());
+                Err(anyhow!("{:?}", String::from_utf8(buf)))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn use_program(&self) {
+        unsafe {
+            gl::UseProgram(self.0);
+        }
+    }
 }
 
 /// Simple loading example
@@ -52,23 +202,18 @@ fn main() {
     }
     "#;
 
+    let va = VertexArray::new().unwrap();
+    va.bind();
+
+    let vb = Buffer::new().unwrap();
+    vb.bind(gl::ARRAY_BUFFER);
+    vb.data(
+        gl::ARRAY_BUFFER,
+        bytemuck::cast_slice(&VERTICES),
+        gl::STATIC_DRAW,
+    );
+
     unsafe {
-        let mut vao = 0;
-        gl::GenVertexArrays(1, &mut vao);
-        assert_ne!(vao, 0);
-        gl::BindVertexArray(vao);
-
-        let mut vbo = 0;
-        gl::GenBuffers(1, &mut vbo);
-        assert_ne!(vbo, 0);
-        gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
-        gl::BufferData(
-            gl::ARRAY_BUFFER,
-            (std::mem::size_of::<Vertex>() * VERTICES.len()) as isize,
-            VERTICES.as_ptr().cast(),
-            gl::STATIC_DRAW,
-        );
-
         gl::VertexAttribPointer(
             0,
             3,
@@ -79,67 +224,17 @@ fn main() {
         );
         gl::EnableVertexAttribArray(0);
 
-        let vertex_shader = gl::CreateShader(gl::VERTEX_SHADER);
-        assert_ne!(vertex_shader, 0);
+        let vertex_shader = Shader::from_source(gl::VERTEX_SHADER, VERT_SHADER).unwrap();
+        let fragment_shader = Shader::from_source(gl::FRAGMENT_SHADER, FRAG_SHADER).unwrap();
 
-        gl::ShaderSource(
-            vertex_shader,
-            1,
-            &(VERT_SHADER.as_bytes().as_ptr().cast()),
-            &(VERT_SHADER.len().try_into().unwrap()),
-        );
-        gl::CompileShader(vertex_shader);
+        let program = Program::new().unwrap();
+        program.attach(&vertex_shader);
+        program.attach(&fragment_shader);
+        program.link().unwrap();
+        program.use_program();
 
-        let mut success = 0;
-        gl::GetShaderiv(vertex_shader, gl::COMPILE_STATUS, &mut success);
-        if success == 0 {
-            let mut buf: Vec<u8> = Vec::with_capacity(1024);
-            let mut log_len = 0_i32;
-            gl::GetShaderInfoLog(vertex_shader, 1024, &mut log_len, buf.as_mut_ptr().cast());
-            buf.set_len(log_len.try_into().unwrap());
-            panic!("Vertex Compile Error: {}", String::from_utf8_lossy(&buf));
-        }
-
-        let fragment_shader = gl::CreateShader(gl::FRAGMENT_SHADER);
-        assert_ne!(fragment_shader, 0);
-
-        gl::ShaderSource(
-            fragment_shader,
-            1,
-            &(FRAG_SHADER.as_bytes().as_ptr().cast()),
-            &(FRAG_SHADER.len().try_into().unwrap()),
-        );
-        gl::CompileShader(fragment_shader);
-
-        let mut success = 0;
-        gl::GetShaderiv(fragment_shader, gl::COMPILE_STATUS, &mut success);
-        if success == 0 {
-            let mut buf: Vec<u8> = Vec::with_capacity(1024);
-            let mut log_len = 0_i32;
-            gl::GetShaderInfoLog(fragment_shader, 1024, &mut log_len, buf.as_mut_ptr().cast());
-            buf.set_len(log_len.try_into().unwrap());
-            panic!("Fragment Compile Error: {}", String::from_utf8_lossy(&buf));
-        }
-
-        let shader_program = gl::CreateProgram();
-        gl::AttachShader(shader_program, vertex_shader);
-        gl::AttachShader(shader_program, fragment_shader);
-        gl::LinkProgram(shader_program);
-
-        let mut success = 0;
-        gl::GetProgramiv(shader_program, gl::LINK_STATUS, &mut success);
-        if success == 0 {
-            let mut buf: Vec<u8> = Vec::with_capacity(1024);
-            let mut log_len = 0_i32;
-            gl::GetProgramInfoLog(shader_program, 1024, &mut log_len, buf.as_mut_ptr().cast());
-            buf.set_len(log_len.try_into().unwrap());
-            panic!("Program Link Error: {}", String::from_utf8_lossy(&buf));
-        }
-
-        gl::DeleteShader(vertex_shader);
-        gl::DeleteShader(fragment_shader);
-
-        gl::UseProgram(shader_program);
+        vertex_shader.delete();
+        fragment_shader.delete();
     }
 
     event_loop.run(move |event, _, control_flow| {
